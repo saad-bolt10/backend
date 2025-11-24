@@ -620,102 +620,11 @@ router.get('/widget-data/:widgetId', protect, async (req, res) => {
 
     const seriesData = {};
 
-    if (widgetType === 'kpi' && dataSourceConfig.metrics) {
-      for (const metric of dataSourceConfig.metrics) {
-        const mappingResult = await database.query(
-          `SELECT variable_name, variable_tag, unit, data_type, expression, requires_post_aggregation
-           FROM device_data_mapping
-           WHERE id = $1`,
-          [metric.propertyId]
-        );
-
-        if (mappingResult.rows.length === 0) {
-          console.warn(`[WIDGET DATA] Property ID ${metric.propertyId} not found`);
-          continue;
-        }
-
-        const mapping = mappingResult.rows[0];
-        const variableTag = mapping.variable_tag;
-        const variableName = mapping.variable_name;
-        const unit = mapping.unit;
-        const expression = mapping.expression;
-        const requiresPostAgg = mapping.requires_post_aggregation;
-
-        console.log(`[WIDGET DATA] Loading KPI series: ${variableName}, postAgg: ${requiresPostAgg}`);
-
-        const { query, params } = buildHistoricalAggregationQuery(
-          companyId,
-          null,
-          variableTag,
-          variableName,
-          expression,
-          requiresPostAgg,
-          timeRange,
-          hierarchyId,
-          deviceId,
-          limit
-        );
-
-        const seriesResult = await database.query(query, params);
-
-        seriesData[variableName] = {
-          data: seriesResult.rows.map(row => ({
-            timestamp: row.timestamp,
-            value: parseFloat(row.value) || 0
-          })),
-          unit: metric.unit || unit || '',
-          propertyName: variableName,
-          isAggregated: true
-        };
-      }
-    } else if (widgetType === 'donut_chart' && dataSourceConfig.metrics) {
-      for (const metric of dataSourceConfig.metrics) {
-        const mappingResult = await database.query(
-          `SELECT variable_name, variable_tag, unit, data_type, expression, requires_post_aggregation
-           FROM device_data_mapping
-           WHERE id = $1`,
-          [metric.propertyId]
-        );
-
-        if (mappingResult.rows.length === 0) {
-          console.warn(`[WIDGET DATA] Property ID ${metric.propertyId} not found`);
-          continue;
-        }
-
-        const mapping = mappingResult.rows[0];
-        const variableTag = mapping.variable_tag;
-        const variableName = mapping.variable_name;
-        const unit = mapping.unit;
-        const expression = mapping.expression;
-        const requiresPostAgg = mapping.requires_post_aggregation;
-
-        console.log(`[WIDGET DATA] Loading donut series: ${variableName}, postAgg: ${requiresPostAgg}`);
-
-        const { query, params } = buildHistoricalAggregationQuery(
-          companyId,
-          null,
-          variableTag,
-          variableName,
-          expression,
-          requiresPostAgg,
-          timeRange,
-          hierarchyId,
-          deviceId,
-          limit
-        );
-
-        const seriesResult = await database.query(query, params);
-
-        seriesData[variableName] = {
-          data: seriesResult.rows.map(row => ({
-            timestamp: row.timestamp,
-            value: parseFloat(row.value) || 0
-          })),
-          unit: unit || '',
-          propertyName: variableName,
-          isAggregated: true
-        };
-      }
+    if ((widgetType === 'kpi' || widgetType === 'donut_chart') && dataSourceConfig.metrics) {
+      return res.status(400).json({
+        success: false,
+        message: `${widgetType} widgets should use the /latest endpoint for real-time data. Use /widget-data/:widgetId/latest instead.`
+      });
     } else if (widgetType === 'line_chart' && dataSourceConfig.seriesConfig) {
       for (const s of dataSourceConfig.seriesConfig) {
         const mappingResult = await database.query(
@@ -816,60 +725,7 @@ router.get('/widget-data/:widgetId/latest', protect, async (req, res) => {
 
     const seriesData = {};
 
-    if (widgetType === 'kpi' && dataSourceConfig.metrics) {
-      for (const metric of dataSourceConfig.metrics) {
-        const mappingResult = await database.query(
-          `SELECT variable_name, variable_tag, unit, expression, requires_post_aggregation
-           FROM device_data_mapping
-           WHERE id = $1`,
-          [metric.propertyId]
-        );
-
-        if (mappingResult.rows.length === 0) {
-          console.warn(`[WIDGET DATA LATEST] Property ID ${metric.propertyId} not found`);
-          continue;
-        }
-
-        const mapping = mappingResult.rows[0];
-        const variableTag = mapping.variable_tag;
-        const variableName = mapping.variable_name;
-        const unit = mapping.unit;
-        const expression = mapping.expression;
-        const requiresPostAgg = mapping.requires_post_aggregation;
-
-        const { query, params } = buildRealtimeAggregationQuery(
-          companyId,
-          null,
-          variableTag,
-          expression,
-          requiresPostAgg,
-          aggregationMethod,
-          hierarchyId,
-          deviceId
-        );
-
-        const dataResult = await database.query(query, params);
-
-        let aggregatedValue = null;
-        let timestamp = null;
-        let deviceCount = null;
-
-        if (dataResult.rows.length > 0) {
-          aggregatedValue = parseFloat(dataResult.rows[0].value) || 0;
-          timestamp = dataResult.rows[0].timestamp;
-          deviceCount = dataResult.rows[0].device_count;
-        }
-
-        seriesData[variableName] = {
-          aggregatedValue,
-          timestamp,
-          deviceCount,
-          unit: metric.unit || unit || '',
-          aggregationMethod,
-          isAggregated: requiresPostAgg && expression
-        };
-      }
-    } else if ((widgetType === 'donut_chart' || widgetType === 'kpi') && dataSourceConfig.metrics) {
+    if ((widgetType === 'kpi' || widgetType === 'donut_chart') && dataSourceConfig.metrics) {
       for (const metric of dataSourceConfig.metrics) {
         const mappingResult = await database.query(
           `SELECT variable_name, variable_tag, unit, expression, requires_post_aggregation
@@ -975,6 +831,11 @@ router.get('/widget-data/:widgetId/latest', protect, async (req, res) => {
           isAggregated: requiresPostAgg && expression
         };
       }
+    } else if (widgetType === 'line_chart' && dataSourceConfig.seriesConfig) {
+      return res.status(400).json({
+        success: false,
+        message: 'Line chart widgets should use the historical endpoint with time range. Use /widget-data/:widgetId instead.'
+      });
     }
 
     res.json({
