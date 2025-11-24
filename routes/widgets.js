@@ -244,47 +244,36 @@ router.post('/create-widget', protect, async (req, res) => {
     let widgetName;
 
     if (widgetTypeName === 'kpi') {
-      if (propertyIds.length !== 1) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({
-          success: false,
-          message: 'KPI widgets require exactly 1 property'
+      const metrics = [];
+      for (const propId of propertyIds) {
+        const mappingResult = await client.query(
+          `SELECT id, variable_name, unit FROM device_data_mapping WHERE id = $1 AND device_type_id = $2`,
+          [propId, deviceTypeId]
+        );
+
+        if (mappingResult.rows.length === 0) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({
+            success: false,
+            message: `Property with ID ${propId} not found for device type ${deviceTypeId}`
+          });
+        }
+
+        metrics.push({
+          propertyId: mappingResult.rows[0].id,
+          variableName: mappingResult.rows[0].variable_name,
+          unit: mappingResult.rows[0].unit || ''
         });
       }
 
-      const mappingResult = await client.query(
-        `SELECT id, variable_name, unit FROM device_data_mapping WHERE id = $1 AND device_type_id = $2`,
-        [propertyIds[0], deviceTypeId]
-      );
-
-      if (mappingResult.rows.length === 0) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({
-          success: false,
-          message: `Property with ID ${propertyIds[0]} not found for device type ${deviceTypeId}`
-        });
-      }
-
-      const mapping = mappingResult.rows[0];
       dataSourceConfig = {
-        metric: mapping.variable_name.toLowerCase(),
-        unit: mapping.unit || '',
-        title: mapping.variable_name,
-        shortTitle: mapping.variable_name.substring(0, 3).toUpperCase(),
-        icons: [],
-        propertyId: mapping.id
+        metrics: metrics,
+        title: displayName || `${metrics.map(m => m.variableName).join('/')} KPI`,
+        displayMode: 'cards'
       };
-      widgetName = displayName || `${mapping.variable_name} KPI`;
+      widgetName = displayName || dataSourceConfig.title;
 
     } else if (widgetTypeName === 'donut_chart') {
-      if (propertyIds.length === 0 || propertyIds.length > 2) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({
-          success: false,
-          message: 'Donut charts require 1 or 2 properties'
-        });
-      }
-
       const metrics = [];
       for (const propId of propertyIds) {
         const mappingResult = await client.query(
@@ -302,13 +291,13 @@ router.post('/create-widget', protect, async (req, res) => {
 
         metrics.push({
           propertyId: mappingResult.rows[0].id,
-          variable_name: mappingResult.rows[0].variable_name
+          variableName: mappingResult.rows[0].variable_name
         });
       }
 
       dataSourceConfig = {
         metrics: metrics,
-        title: displayName || `${metrics.map(m => m.variable_name).join('/')} Donut`
+        title: displayName || `${metrics.map(m => m.variableName).join('/')} Donut`
       };
       widgetName = displayName || dataSourceConfig.title;
 
@@ -627,64 +616,154 @@ router.get('/widget-data/:widgetId', protect, async (req, res) => {
 
     const widget = widgetResult.rows[0];
     const dataSourceConfig = widget.data_source_config;
-
-    if (!dataSourceConfig.seriesConfig || dataSourceConfig.seriesConfig.length === 0) {
-      return res.json({
-        success: true,
-        data: {},
-        config: dataSourceConfig,
-        message: 'No series configured'
-      });
-    }
+    const widgetType = widget.widget_type;
 
     const seriesData = {};
 
-    for (const s of dataSourceConfig.seriesConfig) {
-      const mappingResult = await database.query(
-        `SELECT variable_name, variable_tag, unit, data_type, expression, requires_post_aggregation
-         FROM device_data_mapping
-         WHERE id = $1 AND device_type_id = $2`,
-        [s.propertyId, dataSourceConfig.deviceTypeId]
-      );
+    if (widgetType === 'kpi' && dataSourceConfig.metrics) {
+      for (const metric of dataSourceConfig.metrics) {
+        const mappingResult = await database.query(
+          `SELECT variable_name, variable_tag, unit, data_type, expression, requires_post_aggregation
+           FROM device_data_mapping
+           WHERE id = $1`,
+          [metric.propertyId]
+        );
 
-      if (mappingResult.rows.length === 0) {
-        console.warn(`[WIDGET DATA] Property ID ${s.propertyId} not found`);
-        continue;
+        if (mappingResult.rows.length === 0) {
+          console.warn(`[WIDGET DATA] Property ID ${metric.propertyId} not found`);
+          continue;
+        }
+
+        const mapping = mappingResult.rows[0];
+        const variableTag = mapping.variable_tag;
+        const variableName = mapping.variable_name;
+        const unit = mapping.unit;
+        const expression = mapping.expression;
+        const requiresPostAgg = mapping.requires_post_aggregation;
+
+        console.log(`[WIDGET DATA] Loading KPI series: ${variableName}, postAgg: ${requiresPostAgg}`);
+
+        const { query, params } = buildHistoricalAggregationQuery(
+          companyId,
+          null,
+          variableTag,
+          variableName,
+          expression,
+          requiresPostAgg,
+          timeRange,
+          hierarchyId,
+          deviceId,
+          limit
+        );
+
+        const seriesResult = await database.query(query, params);
+
+        seriesData[variableName] = {
+          data: seriesResult.rows.map(row => ({
+            timestamp: row.timestamp,
+            value: parseFloat(row.value) || 0
+          })),
+          unit: metric.unit || unit || '',
+          propertyName: variableName,
+          isAggregated: true
+        };
       }
+    } else if (widgetType === 'donut_chart' && dataSourceConfig.metrics) {
+      for (const metric of dataSourceConfig.metrics) {
+        const mappingResult = await database.query(
+          `SELECT variable_name, variable_tag, unit, data_type, expression, requires_post_aggregation
+           FROM device_data_mapping
+           WHERE id = $1`,
+          [metric.propertyId]
+        );
 
-      const mapping = mappingResult.rows[0];
-      const variableTag = mapping.variable_tag;
-      const variableName = mapping.variable_name;
-      const unit = mapping.unit;
-      const expression = mapping.expression;
-      const requiresPostAgg = mapping.requires_post_aggregation;
+        if (mappingResult.rows.length === 0) {
+          console.warn(`[WIDGET DATA] Property ID ${metric.propertyId} not found`);
+          continue;
+        }
 
-      console.log(`[WIDGET DATA] Loading series: ${variableName}, postAgg: ${requiresPostAgg}`);
+        const mapping = mappingResult.rows[0];
+        const variableTag = mapping.variable_tag;
+        const variableName = mapping.variable_name;
+        const unit = mapping.unit;
+        const expression = mapping.expression;
+        const requiresPostAgg = mapping.requires_post_aggregation;
 
-      const { query, params } = buildHistoricalAggregationQuery(
-        companyId,
-        dataSourceConfig.deviceTypeId,
-        variableTag,
-        variableName,
-        expression,
-        requiresPostAgg,
-        timeRange,
-        hierarchyId,
-        deviceId,
-        limit
-      );
+        console.log(`[WIDGET DATA] Loading donut series: ${variableName}, postAgg: ${requiresPostAgg}`);
 
-      const seriesResult = await database.query(query, params);
+        const { query, params } = buildHistoricalAggregationQuery(
+          companyId,
+          null,
+          variableTag,
+          variableName,
+          expression,
+          requiresPostAgg,
+          timeRange,
+          hierarchyId,
+          deviceId,
+          limit
+        );
 
-      seriesData[variableName] = {
-        data: seriesResult.rows.map(row => ({
-          timestamp: row.timestamp,
-          value: parseFloat(row.value) || 0
-        })),
-        unit: unit || '',
-        propertyName: variableName,
-        isAggregated: true
-      };
+        const seriesResult = await database.query(query, params);
+
+        seriesData[variableName] = {
+          data: seriesResult.rows.map(row => ({
+            timestamp: row.timestamp,
+            value: parseFloat(row.value) || 0
+          })),
+          unit: unit || '',
+          propertyName: variableName,
+          isAggregated: true
+        };
+      }
+    } else if (widgetType === 'line_chart' && dataSourceConfig.seriesConfig) {
+      for (const s of dataSourceConfig.seriesConfig) {
+        const mappingResult = await database.query(
+          `SELECT variable_name, variable_tag, unit, data_type, expression, requires_post_aggregation
+           FROM device_data_mapping
+           WHERE id = $1 AND device_type_id = $2`,
+          [s.propertyId, dataSourceConfig.deviceTypeId]
+        );
+
+        if (mappingResult.rows.length === 0) {
+          console.warn(`[WIDGET DATA] Property ID ${s.propertyId} not found`);
+          continue;
+        }
+
+        const mapping = mappingResult.rows[0];
+        const variableTag = mapping.variable_tag;
+        const variableName = mapping.variable_name;
+        const unit = mapping.unit;
+        const expression = mapping.expression;
+        const requiresPostAgg = mapping.requires_post_aggregation;
+
+        console.log(`[WIDGET DATA] Loading line series: ${variableName}, postAgg: ${requiresPostAgg}`);
+
+        const { query, params } = buildHistoricalAggregationQuery(
+          companyId,
+          dataSourceConfig.deviceTypeId,
+          variableTag,
+          variableName,
+          expression,
+          requiresPostAgg,
+          timeRange,
+          hierarchyId,
+          deviceId,
+          limit
+        );
+
+        const seriesResult = await database.query(query, params);
+
+        seriesData[variableName] = {
+          data: seriesResult.rows.map(row => ({
+            timestamp: row.timestamp,
+            value: parseFloat(row.value) || 0
+          })),
+          unit: unit || '',
+          propertyName: variableName,
+          isAggregated: true
+        };
+      }
     }
 
     res.json({
@@ -717,7 +796,7 @@ router.get('/widget-data/:widgetId/latest', protect, async (req, res) => {
     console.log(`[WIDGET DATA LATEST] Fetching for widget ${widgetId}, aggregationMethod: ${aggregationMethod}`);
 
     const widgetResult = await database.query(
-      `SELECT wd.data_source_config, wt.component_name
+      `SELECT wd.data_source_config, wt.name as widget_type, wt.component_name
        FROM widget_definitions wd
        INNER JOIN widget_types wt ON wd.widget_type_id = wt.id
        WHERE wd.id = $1`,
@@ -733,68 +812,169 @@ router.get('/widget-data/:widgetId/latest', protect, async (req, res) => {
 
     const widget = widgetResult.rows[0];
     const dataSourceConfig = widget.data_source_config;
-
-    if (!dataSourceConfig.seriesConfig || dataSourceConfig.seriesConfig.length === 0) {
-      return res.json({
-        success: true,
-        data: null,
-        message: 'No series configured'
-      });
-    }
+    const widgetType = widget.widget_type;
 
     const seriesData = {};
 
-    for (const s of dataSourceConfig.seriesConfig) {
-      const mappingResult = await database.query(
-        `SELECT variable_name, variable_tag, unit, expression, requires_post_aggregation
-         FROM device_data_mapping
-         WHERE id = $1 AND device_type_id = $2`,
-        [s.propertyId, dataSourceConfig.deviceTypeId]
-      );
+    if (widgetType === 'kpi' && dataSourceConfig.metrics) {
+      for (const metric of dataSourceConfig.metrics) {
+        const mappingResult = await database.query(
+          `SELECT variable_name, variable_tag, unit, expression, requires_post_aggregation
+           FROM device_data_mapping
+           WHERE id = $1`,
+          [metric.propertyId]
+        );
 
-      if (mappingResult.rows.length === 0) {
-        console.warn(`[WIDGET DATA LATEST] Property ID ${s.propertyId} not found`);
-        continue;
+        if (mappingResult.rows.length === 0) {
+          console.warn(`[WIDGET DATA LATEST] Property ID ${metric.propertyId} not found`);
+          continue;
+        }
+
+        const mapping = mappingResult.rows[0];
+        const variableTag = mapping.variable_tag;
+        const variableName = mapping.variable_name;
+        const unit = mapping.unit;
+        const expression = mapping.expression;
+        const requiresPostAgg = mapping.requires_post_aggregation;
+
+        const { query, params } = buildRealtimeAggregationQuery(
+          companyId,
+          null,
+          variableTag,
+          expression,
+          requiresPostAgg,
+          aggregationMethod,
+          hierarchyId,
+          deviceId
+        );
+
+        const dataResult = await database.query(query, params);
+
+        let aggregatedValue = null;
+        let timestamp = null;
+        let deviceCount = null;
+
+        if (dataResult.rows.length > 0) {
+          aggregatedValue = parseFloat(dataResult.rows[0].value) || 0;
+          timestamp = dataResult.rows[0].timestamp;
+          deviceCount = dataResult.rows[0].device_count;
+        }
+
+        seriesData[variableName] = {
+          aggregatedValue,
+          timestamp,
+          deviceCount,
+          unit: metric.unit || unit || '',
+          aggregationMethod,
+          isAggregated: requiresPostAgg && expression
+        };
       }
+    } else if ((widgetType === 'donut_chart' || widgetType === 'kpi') && dataSourceConfig.metrics) {
+      for (const metric of dataSourceConfig.metrics) {
+        const mappingResult = await database.query(
+          `SELECT variable_name, variable_tag, unit, expression, requires_post_aggregation
+           FROM device_data_mapping
+           WHERE id = $1`,
+          [metric.propertyId]
+        );
 
-      const mapping = mappingResult.rows[0];
-      const variableTag = mapping.variable_tag;
-      const variableName = mapping.variable_name;
-      const unit = mapping.unit;
-      const expression = mapping.expression;
-      const requiresPostAgg = mapping.requires_post_aggregation;
+        if (mappingResult.rows.length === 0) {
+          console.warn(`[WIDGET DATA LATEST] Property ID ${metric.propertyId} not found`);
+          continue;
+        }
 
-      const { query, params } = buildRealtimeAggregationQuery(
-        companyId,
-        dataSourceConfig.deviceTypeId,
-        variableTag,
-        expression,
-        requiresPostAgg,
-        aggregationMethod,
-        hierarchyId,
-        deviceId
-      );
+        const mapping = mappingResult.rows[0];
+        const variableTag = mapping.variable_tag;
+        const variableName = mapping.variable_name;
+        const unit = mapping.unit;
+        const expression = mapping.expression;
+        const requiresPostAgg = mapping.requires_post_aggregation;
 
-      const dataResult = await database.query(query, params);
+        const { query, params } = buildRealtimeAggregationQuery(
+          companyId,
+          null,
+          variableTag,
+          expression,
+          requiresPostAgg,
+          aggregationMethod,
+          hierarchyId,
+          deviceId
+        );
 
-      let aggregatedValue = null;
-      let timestamp = null;
-      let deviceCount = null;
+        const dataResult = await database.query(query, params);
 
-      if (dataResult.rows.length > 0) {
-        aggregatedValue = parseFloat(dataResult.rows[0].value) || 0;
-        timestamp = dataResult.rows[0].timestamp;
-        deviceCount = dataResult.rows[0].device_count;
+        let aggregatedValue = null;
+        let timestamp = null;
+        let deviceCount = null;
+
+        if (dataResult.rows.length > 0) {
+          aggregatedValue = parseFloat(dataResult.rows[0].value) || 0;
+          timestamp = dataResult.rows[0].timestamp;
+          deviceCount = dataResult.rows[0].device_count;
+        }
+
+        seriesData[variableName] = {
+          aggregatedValue,
+          timestamp,
+          deviceCount,
+          unit: unit || '',
+          aggregationMethod,
+          isAggregated: requiresPostAgg && expression
+        };
       }
+    } else if (widgetType === 'line_chart' && dataSourceConfig.seriesConfig) {
+      for (const s of dataSourceConfig.seriesConfig) {
+        const mappingResult = await database.query(
+          `SELECT variable_name, variable_tag, unit, expression, requires_post_aggregation
+           FROM device_data_mapping
+           WHERE id = $1 AND device_type_id = $2`,
+          [s.propertyId, dataSourceConfig.deviceTypeId]
+        );
 
-      seriesData[variableName] = {
-        aggregatedValue,
-        timestamp,
-        deviceCount,
-        unit,
-        aggregationMethod,
-        isAggregated: requiresPostAgg && expression
-      };
+        if (mappingResult.rows.length === 0) {
+          console.warn(`[WIDGET DATA LATEST] Property ID ${s.propertyId} not found`);
+          continue;
+        }
+
+        const mapping = mappingResult.rows[0];
+        const variableTag = mapping.variable_tag;
+        const variableName = mapping.variable_name;
+        const unit = mapping.unit;
+        const expression = mapping.expression;
+        const requiresPostAgg = mapping.requires_post_aggregation;
+
+        const { query, params } = buildRealtimeAggregationQuery(
+          companyId,
+          dataSourceConfig.deviceTypeId,
+          variableTag,
+          expression,
+          requiresPostAgg,
+          aggregationMethod,
+          hierarchyId,
+          deviceId
+        );
+
+        const dataResult = await database.query(query, params);
+
+        let aggregatedValue = null;
+        let timestamp = null;
+        let deviceCount = null;
+
+        if (dataResult.rows.length > 0) {
+          aggregatedValue = parseFloat(dataResult.rows[0].value) || 0;
+          timestamp = dataResult.rows[0].timestamp;
+          deviceCount = dataResult.rows[0].device_count;
+        }
+
+        seriesData[variableName] = {
+          aggregatedValue,
+          timestamp,
+          deviceCount,
+          unit,
+          aggregationMethod,
+          isAggregated: requiresPostAgg && expression
+        };
+      }
     }
 
     res.json({
