@@ -225,40 +225,136 @@ router.post('/create-widget', protect, async (req, res) => {
 
     await client.query('BEGIN');
 
-    const seriesConfig = [];
-    for (const propId of propertyIds) {
+    const widgetTypeResult = await client.query(
+      'SELECT name FROM widget_types WHERE id = $1',
+      [widgetTypeId]
+    );
+
+    if (widgetTypeResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        success: false,
+        message: 'Widget type not found'
+      });
+    }
+
+    const widgetTypeName = widgetTypeResult.rows[0].name;
+
+    let dataSourceConfig;
+    let widgetName;
+
+    if (widgetTypeName === 'kpi') {
+      if (propertyIds.length !== 1) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          success: false,
+          message: 'KPI widgets require exactly 1 property'
+        });
+      }
+
       const mappingResult = await client.query(
-        `SELECT id FROM device_data_mapping WHERE id = $1 AND device_type_id = $2`,
-        [propId, deviceTypeId]
+        `SELECT id, variable_name, unit FROM device_data_mapping WHERE id = $1 AND device_type_id = $2`,
+        [propertyIds[0], deviceTypeId]
       );
 
       if (mappingResult.rows.length === 0) {
         await client.query('ROLLBACK');
         return res.status(400).json({
           success: false,
-          message: `Property with ID ${propId} not found for device type ${deviceTypeId}`
+          message: `Property with ID ${propertyIds[0]} not found for device type ${deviceTypeId}`
         });
       }
 
-      seriesConfig.push({
-        propertyId: mappingResult.rows[0].id
+      const mapping = mappingResult.rows[0];
+      dataSourceConfig = {
+        metric: mapping.variable_name.toLowerCase(),
+        unit: mapping.unit || '',
+        title: mapping.variable_name,
+        shortTitle: mapping.variable_name.substring(0, 3).toUpperCase(),
+        icons: [],
+        propertyId: mapping.id
+      };
+      widgetName = displayName || `${mapping.variable_name} KPI`;
+
+    } else if (widgetTypeName === 'donut_chart') {
+      if (propertyIds.length === 0 || propertyIds.length > 2) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          success: false,
+          message: 'Donut charts require 1 or 2 properties'
+        });
+      }
+
+      const metrics = [];
+      for (const propId of propertyIds) {
+        const mappingResult = await client.query(
+          `SELECT id, variable_name FROM device_data_mapping WHERE id = $1 AND device_type_id = $2`,
+          [propId, deviceTypeId]
+        );
+
+        if (mappingResult.rows.length === 0) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({
+            success: false,
+            message: `Property with ID ${propId} not found for device type ${deviceTypeId}`
+          });
+        }
+
+        metrics.push({
+          propertyId: mappingResult.rows[0].id,
+          variable_name: mappingResult.rows[0].variable_name
+        });
+      }
+
+      dataSourceConfig = {
+        metrics: metrics,
+        title: displayName || `${metrics.map(m => m.variable_name).join('/')} Donut`
+      };
+      widgetName = displayName || dataSourceConfig.title;
+
+    } else if (widgetTypeName === 'line_chart') {
+      const seriesConfig = [];
+      for (const propId of propertyIds) {
+        const mappingResult = await client.query(
+          `SELECT id FROM device_data_mapping WHERE id = $1 AND device_type_id = $2`,
+          [propId, deviceTypeId]
+        );
+
+        if (mappingResult.rows.length === 0) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({
+            success: false,
+            message: `Property with ID ${propId} not found for device type ${deviceTypeId}`
+          });
+        }
+
+        seriesConfig.push({
+          propertyId: mappingResult.rows[0].id
+        });
+      }
+
+      dataSourceConfig = {
+        deviceTypeId: parseInt(deviceTypeId),
+        numberOfSeries: propertyIds.length,
+        seriesConfig: seriesConfig
+      };
+      widgetName = displayName || `Custom Chart (${propertyIds.length} series)`;
+
+    } else {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        success: false,
+        message: `Unsupported widget type: ${widgetTypeName}`
       });
     }
 
-    const dataSourceConfig = {
-      deviceTypeId: parseInt(deviceTypeId),
-      numberOfSeries: propertyIds.length,
-      seriesConfig: seriesConfig
-    };
-
-    const widgetName = displayName || `Custom Chart (${propertyIds.length} series)`;
     const widgetResult = await client.query(
       `INSERT INTO widget_definitions (name, description, widget_type_id, data_source_config, created_by)
        VALUES ($1, $2, $3, $4, $5)
        RETURNING id`,
       [
         widgetName,
-        `Custom widget for device type ${deviceTypeId}`,
+        `Custom ${widgetTypeName} widget for device type ${deviceTypeId}`,
         widgetTypeId,
         JSON.stringify(dataSourceConfig),
         req.user.id
@@ -286,13 +382,22 @@ router.post('/create-widget', protect, async (req, res) => {
       );
       const nextOrder = maxOrderResult.rows[0].max_order + 1;
 
+      let layoutConfig;
+      if (widgetTypeName === 'kpi') {
+        layoutConfig = { x: 0, y: 0, w: 3, h: 2, minW: 2, minH: 1, static: false };
+      } else if (widgetTypeName === 'donut_chart') {
+        layoutConfig = { x: 0, y: 0, w: 6, h: 4, minW: 4, minH: 2, static: false };
+      } else {
+        layoutConfig = { x: 0, y: 0, w: 6, h: 3, minW: 3, minH: 2, static: false };
+      }
+
       await client.query(
         `INSERT INTO dashboard_layouts (dashboard_id, widget_definition_id, layout_config, display_order)
          VALUES ($1, $2, $3, $4)`,
         [
           dashboardId,
           widgetId,
-          JSON.stringify({ x: 0, y: 0, w: 6, h: 3, minW: 3, minH: 2, static: false }),
+          JSON.stringify(layoutConfig),
           nextOrder
         ]
       );
@@ -319,7 +424,7 @@ router.post('/create-widget', protect, async (req, res) => {
     });
   } finally {
     client.release();
-  } 
+  }
 });
 
 router.post('/add-to-dashboard', protect, async (req, res) => {
